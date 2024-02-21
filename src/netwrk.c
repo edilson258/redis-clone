@@ -1,3 +1,4 @@
+#include "../include/parse.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <pthread.h>
@@ -167,22 +168,18 @@ size_t extract_content_len(char *text) {
   return content_len;
 }
 
-typedef struct {
-  char *key;
-  char *value;
-} KV;
-
-void parse_content(char *content, KV *kv) {
-  printf("Parsing: %s\n", content);
-}
-
-void handle_request_post(Request *req) { 
+void handle_request_post(Request *req) {
   size_t offset = req->data->length - extract_content_len(req->data->text);
-  KV *kv = malloc(sizeof(KV));
-  kv->key = NULL;
-  kv->value = NULL;
+  KeyValueData kv = {0};
 
-  parse_content(req->data->text + offset, kv);
+  if (parse_post_content(req->data->text + offset, &kv)) {
+    respond_with_error(req->remote_fd, "400",
+                       "Invalid post data. expected: {\"key\":\"value\"}");
+    pthread_exit(NULL);
+  }
+
+  printf("Key: %s\n", kv.key);
+  printf("Val: %s\n", kv.value);
 }
 
 void handle_request(int remote_fd) {
