@@ -1,3 +1,4 @@
+#include "../include/network.h"
 #include "../include/parse.h"
 #include <arpa/inet.h>
 #include <errno.h>
@@ -8,27 +9,6 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
-
-#define HOST "127.0.0.1"
-#define PORT 8080
-#define MAX_CONN 10
-#define CHUNK_SIZE 256
-
-typedef struct {
-  char *text;
-  size_t length;
-} RequestData;
-
-typedef enum {
-  GET = 0,
-  POST,
-} RequestMethod;
-
-typedef struct {
-  int remote_fd;
-  RequestData *data;
-  RequestMethod method;
-} Request;
 
 /*
  * Note:
@@ -85,7 +65,7 @@ RequestData *request_extract_data(int remote_fd) {
   return rdata;
 }
 
-char *slice(RequestData *rdata, int count) {
+char *slice(RequestData *rdata, size_t count) {
   if (rdata->length < count) {
     fprintf(stderr,
             "[ERROR]: Couldn't get slice: count is grather than text length\n");
@@ -96,13 +76,13 @@ char *slice(RequestData *rdata, int count) {
   return out;
 }
 
-void respond_with_error(int remote_fd, char *statcode, char *reason) {
-  char *body_templ = "{\"ERROR\": \"%s\"}";
+void respond_with_text(int remote_fd, char *statcode, char *reason) {
+  char *body_templ = "%s";
   size_t body_len = 1 + snprintf(NULL, 0, body_templ, reason);
   char body[body_len];
   snprintf(body, body_len, body_templ, reason);
   char *header_templ = "HTTP/1.1 %s\r\n"
-                       "Content-Type: application/json\r\n"
+                       "Content-Type: text/plain\r\n"
                        "Content-Length: %zu\r\n"
                        "\r\n";
   size_t header_len = 1 + snprintf(NULL, 0, header_templ, statcode, body_len);
@@ -112,7 +92,6 @@ void respond_with_error(int remote_fd, char *statcode, char *reason) {
   char res[res_len];
   snprintf(res, res_len, "%s%s", header, body);
   send(remote_fd, res, res_len, 0);
-  close(remote_fd);
 }
 
 /*
@@ -128,7 +107,8 @@ RequestMethod request_extract_method(RequestData *rdata, int remote_fd) {
   }
 
   fprintf(stderr, "[ERROR]: Unsupported request method\n");
-  respond_with_error(remote_fd, "405", "Unsupported request method");
+  respond_with_text(remote_fd, "405", "ERROR: Unsupported request method");
+  close(remote_fd);
   pthread_exit(NULL);
 }
 
@@ -168,21 +148,42 @@ size_t extract_content_len(char *text) {
   return content_len;
 }
 
-void handle_request_post(Request *req) {
+void handle_request_post(Redis *r, Request *req) {
   size_t offset = req->data->length - extract_content_len(req->data->text);
-  KeyValueData kv = {0};
+  KeyValueData *kv = malloc(sizeof(KeyValueData));
 
-  if (parse_post_content(req->data->text + offset, &kv)) {
-    respond_with_error(req->remote_fd, "400",
-                       "Invalid post data. expected: {\"key\":\"value\"}");
-    pthread_exit(NULL);
+  if (parse_post_content(req->data->text + offset, kv)) {
+    fprintf(stderr,
+            "[ERROR]:%s:%d => Couldn't parse_post_content for remote_fd: %d\n",
+            __FILE_NAME__, __LINE__, req->remote_fd);
+    respond_with_text(req->remote_fd, "400",
+                      "ERROR: Invalid post data. expect: {\"key\":\"value\"}");
+    close(req->remote_fd);
   }
 
-  printf("Key: %s\n", kv.key);
-  printf("Val: %s\n", kv.value);
+  if (redis_store(r, kv)) {
+    fprintf(stderr,
+            "[ERROR]:%s:%d => Couldn't store user data for remote_fd: %d\n",
+            __FILE_NAME__, __LINE__, req->remote_fd);
+    respond_with_text(req->remote_fd, "500", redis_get_error());
+    close(req->remote_fd);
+  }
+
+  respond_with_text(req->remote_fd, "201", "Data stored successfully");
+  close(req->remote_fd);
+
+  free(req->data->text);
+  free(req->data);
 }
 
-void handle_request(int remote_fd) {
+void handle_request_get(Redis *r, Request *req) {
+  (void) r;
+  respond_with_text(req->remote_fd, "404",
+                    "ERROR: Can't handle GET requests for now");
+  printf("Can't handle GET requests for now\n");
+}
+
+void handle_request(Redis *r, int remote_fd) {
   Request *req = request_build(remote_fd);
 
   /*
@@ -190,32 +191,21 @@ void handle_request(int remote_fd) {
    */
   switch (req->method) {
   case GET:
-    respond_with_error(remote_fd, "404", "Can't handle GET requests for now");
-    printf("Can't handle GET requests for now\n");
-    return;
+    handle_request_get(r, req);
+    break;
   case POST:
-    handle_request_post(req);
-    return;
+    handle_request_post(r, req);
+    break;
   }
 }
 
-void handle_response(int remote_fd) {
-  char *res = "HTTP/1.1 200 OK\r\n"
-              "Content-Type: text/plain\r\n"
-              "Content-Length: 13\r\n"
-              "\r\n"
-              "Hello, World!\r\n";
+void *handle_client(void *_thread_input) {
+  ThreadInput *thread_id = (ThreadInput *)_thread_input;
 
-  send(remote_fd, res, strlen(res), 0);
-}
+  handle_request(thread_id->r, thread_id->remote_fd);
 
-void *handle_client(void *_remote_fd) {
-  int remote_fd = *(int *)_remote_fd;
+  // Note: remote_fd is closed
 
-  handle_request(remote_fd);
-  handle_response(remote_fd);
-
-  close(remote_fd);
   return NULL;
 }
 
@@ -228,7 +218,7 @@ void *handle_client(void *_remote_fd) {
  * @RETURN:
  * - will return server socket's file descriptor
  */
-int create_server_socket() {
+int create_server_socket(void) {
   printf("[INFO]: Creating Server Socket...\n");
   int sfd = socket(AF_INET, SOCK_STREAM, 0);
 
@@ -244,7 +234,7 @@ int create_server_socket() {
 
   struct sockaddr_in saddr = {.sin_family = AF_INET,
                               .sin_port = htons(PORT),
-                              .sin_addr = inet_addr(HOST)};
+                              .sin_addr.s_addr = inet_addr(HOST)};
 
   socklen_t saddr_len = sizeof(saddr);
 
@@ -263,27 +253,4 @@ int create_server_socket() {
   return sfd;
 }
 
-int main(void) {
-  int sfd = create_server_socket();
-
-  if (sfd == -1) {
-    return -1;
-  }
-
-  // Main loop
-  while (1) {
-    int remote_fd = accept(sfd, NULL, 0);
-    if (remote_fd == -1) {
-      fprintf(stderr, "[ERROR]: Couldn't Accept: %s\n", strerror(errno));
-      continue;
-    }
-
-    pthread_t thread_id;
-    pthread_create(&thread_id, NULL, handle_client, &remote_fd);
-    pthread_join(thread_id, NULL);
-  };
-
-  close(sfd);
-
-  return 0;
-}
+int accept_conn(int sfd) { return accept(sfd, NULL, 0); }
